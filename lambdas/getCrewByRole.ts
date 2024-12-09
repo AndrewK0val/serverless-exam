@@ -1,56 +1,115 @@
-import { DynamoDB } from "aws-sdk";
-import { APIGatewayProxyHandler } from "aws-lambda";
+import { APIGatewayProxyHandlerV2 } from "aws-lambda";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  QueryCommand,
+  QueryCommandInput,
+  GetCommand,
+} from "@aws-sdk/lib-dynamodb";
+import Ajv from "ajv";
+import schema from "../shared/types.schema.json";
 
-const ddb = new DynamoDB.DocumentClient();
-const TABLE_NAME = process.env.TABLE_NAME || "";
+type ResponseBody = {
+  data: {
+    crew?: any[];
+  };
+};
 
-export const handler: APIGatewayProxyHandler = async (event) => {
-    const { role, movieId } = event.pathParameters || {};
-    const name = event.queryStringParameters?.name;
-  
-    if (!role || !movieId) {
+const ajv = new Ajv({ coerceTypes: true });
+const isValidQueryParams = ajv.compile(
+  schema.definitions["CrewQueryParams"] || {}
+);
+const ddbDocClient = createDDbDocClient();
+
+export const handler: APIGatewayProxyHandlerV2 = async (event, context) => {
+  try {
+    console.log("Event: ", JSON.stringify(event));
+
+    const pathParameters = event?.pathParameters;
+    const queryStringParameters = event?.queryStringParameters;
+    const movieId = pathParameters?.movieId
+      ? parseInt(pathParameters.movieId)
+      : undefined;
+    const role = pathParameters?.role;
+    const nameSubstring = queryStringParameters?.name;
+
+    if (!movieId || !role) {
       return {
-        statusCode: 400,
-        body: JSON.stringify({ message: "Missing required parameters." }),
+        statusCode: 404,
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ Message: "Missing required path parameters" }),
       };
     }
 
-  try {
-    const params = {
-      TableName: TABLE_NAME,
-      KeyConditionExpression: "movieId = :movieId and crewRole = :crewRole",
+    const queryCommandInput: QueryCommandInput = {
+      TableName: process.env.TABLE_NAME,
+      KeyConditionExpression: "movieId = :m AND crewRole = :r",
       ExpressionAttributeValues: {
-        ":movieId": parseInt(movieId, 10),
-        ":crewRole": role,
+        ":m": movieId,
+        ":r": role,
       },
     };
 
-    const result = await ddb.query(params).promise();
+    const queryCommandOutput = await ddbDocClient.send(
+      new QueryCommand(queryCommandInput)
+    );
 
-    if (!result.Items || result.Items.length === 0) {
+    if (!queryCommandOutput.Items || queryCommandOutput.Items.length === 0) {
       return {
         statusCode: 404,
-        body: JSON.stringify({
-          message: `No crew members found for role '${role}' in movie '${movieId}'.`,
-        }),
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ Message: "No crew members found" }),
       };
     }
 
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        crew: result.Items,
-      }),
+    let crew = queryCommandOutput.Items;
+
+    // Filter by name substring if provided
+    if (nameSubstring) {
+      crew = crew.filter((member) =>
+        member.name.toLowerCase().includes(nameSubstring.toLowerCase())
+      );
+    }
+
+    const responseBody: ResponseBody = {
+      data: {
+        crew: crew,
+      },
     };
-  } catch (error) {
-    console.error("Error fetching data:", error);
 
     return {
+      statusCode: 200,
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(responseBody),
+    };
+  } catch (error: any) {
+    console.error("Error: ", JSON.stringify(error));
+    return {
       statusCode: 500,
-      body: JSON.stringify({
-        message: "An error occurred while fetching data.",
-        error: error.message,
-      }),
+      headers: {
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ error: error.message }),
     };
   }
 };
+
+function createDDbDocClient() {
+  const ddbClient = new DynamoDBClient({ region: process.env.REGION });
+  const marshallOptions = {
+    convertEmptyValues: true,
+    removeUndefinedValues: true,
+    convertClassInstanceToMap: true,
+  };
+  const unmarshallOptions = {
+    wrapNumbers: false,
+  };
+  const translateConfig = { marshallOptions, unmarshallOptions };
+  return DynamoDBDocumentClient.from(ddbClient, translateConfig);
+}
